@@ -93,6 +93,7 @@ export interface ClipOutput {
   endMs: number;
   durationMs: number;
   videoPath: string;
+  coverPath: string;
   subtitlePath: string;
   metadataPath: string;
   transcriptJa: string;

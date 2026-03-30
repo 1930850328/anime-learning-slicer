@@ -1,11 +1,13 @@
-import { access, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
+import chokidar from "chokidar";
 import { Command } from "commander";
 
 import { generateSubtitleCuesFromVideo } from "./lib/asr.js";
-import { ensureDirectory, sliceVideoFile } from "./lib/ffmpeg.js";
+import { detectAppDirectory, publishManifestToApp } from "./lib/publish.js";
+import { ensureDirectory, extractVideoCover, sliceVideoFile } from "./lib/ffmpeg.js";
 import { buildSlicePlan } from "./lib/slicer.js";
 import { parseSubtitleFile, writeVttFile } from "./lib/subtitles.js";
 import type { ClipOutput, SliceManifest, SliceOptions, SubtitleBuildResult } from "./types.js";
@@ -50,9 +52,16 @@ async function resolveSubtitleBuild(inputPath: string, subtitlePath?: string) {
   });
 }
 
-async function exportClips(inputPath: string, outputDir: string, subtitleBuild: SubtitleBuildResult, plan: Awaited<ReturnType<typeof buildSlicePlan>>, options: SliceOptions) {
+async function exportClips(
+  inputPath: string,
+  outputDir: string,
+  subtitleBuild: SubtitleBuildResult,
+  plan: Awaited<ReturnType<typeof buildSlicePlan>>,
+  options: SliceOptions,
+) {
   const clipsDir = join(outputDir, "clips");
-  await ensureDirectory(clipsDir);
+  const coversDir = join(outputDir, "covers");
+  await Promise.all([ensureDirectory(clipsDir), ensureDirectory(coversDir)]);
 
   const exported: ClipOutput[] = [];
 
@@ -60,11 +69,13 @@ async function exportClips(inputPath: string, outputDir: string, subtitleBuild: 
     const clip = plan.clips[index];
     const baseName = `${String(index + 1).padStart(2, "0")}-${slugify(clip.clipTitle, `clip-${index + 1}`)}`;
     const videoPath = join(clipsDir, `${baseName}.mp4`);
+    const coverPath = join(coversDir, `${baseName}.jpg`);
     const subtitlePath = join(clipsDir, `${baseName}.vtt`);
     const metadataPath = join(clipsDir, `${baseName}.json`);
 
     console.log(`[slice] Rendering ${basename(videoPath)} (${Math.round(clip.durationMs / 1000)}s)`);
     await sliceVideoFile(inputPath, videoPath, clip.startMs, clip.endMs);
+    await extractVideoCover(videoPath, coverPath, Math.max(300, Math.round(clip.durationMs * 0.33)));
     await writeVttFile(subtitlePath, clip.segments);
 
     const metadata: ClipOutput = {
@@ -76,6 +87,7 @@ async function exportClips(inputPath: string, outputDir: string, subtitleBuild: 
       endMs: clip.endMs,
       durationMs: clip.durationMs,
       videoPath,
+      coverPath,
       subtitlePath,
       metadataPath,
       transcriptJa: clip.transcriptJa,
@@ -96,6 +108,39 @@ async function exportClips(inputPath: string, outputDir: string, subtitleBuild: 
   return exported;
 }
 
+async function publishIfEnabled(
+  manifest: SliceManifest,
+  options: {
+    app?: string;
+    publish?: boolean;
+    publishedSlug?: string;
+  },
+) {
+  if (options.publish === false) {
+    return null;
+  }
+
+  const appDir = options.app ? resolve(options.app) : await detectAppDirectory();
+  if (!appDir) {
+    console.log("[publish] No app directory detected. Skipping auto-publish.");
+    return null;
+  }
+
+  const published = await publishManifestToApp(manifest, appDir, options.publishedSlug);
+  console.log(
+    `[publish] Synced ${published.clipCount} clips to ${published.appDir} (${published.publicManifestPath})`,
+  );
+  return published;
+}
+
+async function loadManifestFromPath(manifestPath: string) {
+  const raw = JSON.parse(await readFile(manifestPath, "utf8")) as SliceManifest;
+  if (!raw || typeof raw !== "object" || !Array.isArray(raw.clips) || typeof raw.animeTitle !== "string") {
+    throw new Error(`Invalid slicer manifest: ${manifestPath}`);
+  }
+  return raw;
+}
+
 async function runSliceCommand(options: {
   input: string;
   anime: string;
@@ -106,6 +151,9 @@ async function runSliceCommand(options: {
   maxClips: string;
   minDuration: string;
   maxDuration: string;
+  app?: string;
+  publish?: boolean;
+  publishedSlug?: string;
 }) {
   const inputPath = resolve(options.input);
   const subtitlePath = options.subtitle ? resolve(options.subtitle) : undefined;
@@ -160,6 +208,47 @@ async function runSliceCommand(options: {
 
   await writeFile(join(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   console.log(`[done] Wrote ${exportedClips.length} clips and manifest.`);
+  await publishIfEnabled(manifest, options);
+}
+
+async function runSyncAppCommand(options: {
+  manifest: string;
+  app?: string;
+  slug?: string;
+  watch?: boolean;
+}) {
+  const manifestPath = resolve(options.manifest);
+  await ensureFileExists(manifestPath);
+
+  const syncOnce = async () => {
+    const manifest = await loadManifestFromPath(manifestPath);
+    await publishIfEnabled(manifest, {
+      app: options.app,
+      publish: true,
+      publishedSlug: options.slug,
+    });
+  };
+
+  await syncOnce();
+
+  if (!options.watch) {
+    return;
+  }
+
+  console.log(`[watch] Watching ${manifestPath} for changes...`);
+  const watcher = chokidar.watch(manifestPath, {
+    ignoreInitial: true,
+    awaitWriteFinish: {
+      stabilityThreshold: 500,
+      pollInterval: 100,
+    },
+  });
+
+  watcher.on("change", () => {
+    void syncOnce().catch((error) => {
+      console.error(error instanceof Error ? error.message : error);
+    });
+  });
 }
 
 const program = new Command();
@@ -179,9 +268,27 @@ program
   .option("--max-clips <count>", "Maximum number of clips.", "15")
   .option("--min-duration <seconds>", "Minimum duration per clip in seconds.", "10")
   .option("--max-duration <seconds>", "Maximum duration per clip in seconds.", "60")
+  .option("--app <dir>", "Auto-publish clips into a YuruNihongo app repo after slicing.")
+  .option("--published-slug <slug>", "Optional folder slug when auto-publishing to the app.")
+  .option("--no-publish", "Do not auto-publish into the detected YuruNihongo app repo.")
   .action(async (options) => {
     try {
       await runSliceCommand(options);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : error);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("sync-app")
+  .requiredOption("--manifest <path>", "Path to a generated manifest.json from anime-learning-slicer.")
+  .option("--app <dir>", "Target YuruNihongo app directory.")
+  .option("--slug <slug>", "Optional publish folder slug.")
+  .option("--watch", "Watch the manifest and re-publish when it changes.", false)
+  .action(async (options) => {
+    try {
+      await runSyncAppCommand(options);
     } catch (error) {
       console.error(error instanceof Error ? error.message : error);
       process.exitCode = 1;

@@ -71,7 +71,7 @@ function normalizeSegments(segments: TranscriptSegment[], offsetMs: number, maxD
     .filter((segment) => segment.endMs > segment.startMs);
 }
 
-function buildFallbackCandidates(segments: TranscriptSegment[], minMs: number, maxMs: number) {
+function buildFallbackCandidates(segments: TranscriptSegment[], minMs: number) {
   const fallback: SliceCandidate[] = [];
   let startIndex = 0;
 
@@ -80,11 +80,6 @@ function buildFallbackCandidates(segments: TranscriptSegment[], minMs: number, m
     let endMs = segments[startIndex].endMs;
 
     while (endIndex + 1 < segments.length && endMs - segments[startIndex].startMs < minMs) {
-      endIndex += 1;
-      endMs = segments[endIndex].endMs;
-    }
-
-    while (endIndex + 1 < segments.length && segments[endIndex + 1].endMs - segments[startIndex].startMs <= maxMs) {
       endIndex += 1;
       endMs = segments[endIndex].endMs;
     }
@@ -152,7 +147,7 @@ function buildCandidateWindows(
     return candidates.sort((left, right) => right.score - left.score);
   }
 
-  return buildFallbackCandidates(segments, minMs, maxMs);
+  return buildFallbackCandidates(segments, minMs);
 }
 
 function selectCandidates(candidates: SliceCandidate[], minClips: number, maxClips: number) {
@@ -189,6 +184,30 @@ function selectCandidates(candidates: SliceCandidate[], minClips: number, maxCli
   return selected.sort((left, right) => left.startMs - right.startMs);
 }
 
+function ensureMinimumClips(
+  selected: SliceCandidate[],
+  fallbackCandidates: SliceCandidate[],
+  minClips: number,
+) {
+  if (selected.length >= minClips) {
+    return selected.sort((left, right) => left.startMs - right.startMs);
+  }
+
+  const next = [...selected];
+  for (const candidate of fallbackCandidates) {
+    if (next.some((existing) => overlapRatio(existing, candidate) > 0.8)) {
+      continue;
+    }
+
+    next.push(candidate);
+    if (next.length >= minClips) {
+      break;
+    }
+  }
+
+  return next.sort((left, right) => left.startMs - right.startMs);
+}
+
 function buildClipTitle(options: SliceOptions, index: number, points: KnowledgePoint[]) {
   const pointLabel = points.slice(0, 2).map((point) => point.expression).join(" / ");
   const episode = options.episodeTitle ? ` ${options.episodeTitle}` : "";
@@ -214,7 +233,17 @@ export async function buildSlicePlan(options: SliceOptions, subtitleBuild: Subti
   const minMs = Math.max(10_000, Math.round(options.minDurationSec * 1000));
   const maxMs = Math.max(minMs, Math.round(options.maxDurationSec * 1000));
   const candidates = buildCandidateWindows(segments, knowledgePoints, minMs, maxMs);
-  const selected = selectCandidates(candidates, options.minClips, options.maxClips);
+  const fallbackCandidates = buildFallbackCandidates(segments, minMs);
+  const preferredSelection = selectCandidates(candidates, options.minClips, options.maxClips);
+  const fallbackSelection = selectCandidates(
+    fallbackCandidates,
+    options.minClips,
+    options.maxClips,
+  );
+  const selected =
+    preferredSelection.length >= options.minClips
+      ? preferredSelection
+      : ensureMinimumClips(fallbackSelection, fallbackCandidates, options.minClips);
 
   const clips: PreparedClip[] = selected.map((candidate, index) => {
     const clipKnowledge = uniquePoints(candidate.knowledgePoints);
