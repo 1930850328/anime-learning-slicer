@@ -1,6 +1,6 @@
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 
 import chokidar from "chokidar";
 import { Command } from "commander";
@@ -12,6 +12,64 @@ import { buildSlicePlan } from "./lib/slicer.js";
 import { parseSubtitleFile, writeVttFile } from "./lib/subtitles.js";
 import type { ClipOutput, SliceManifest, SliceOptions, SubtitleBuildResult } from "./types.js";
 
+const VIDEO_EXTENSIONS = new Set([".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"]);
+const SUBTITLE_EXTENSIONS = [".ass", ".srt", ".vtt"];
+
+interface AutoMetadata {
+  animeTitle?: string;
+  episodeTitle?: string;
+  publishedSlug?: string;
+  minClips?: number;
+  maxClips?: number;
+  minDurationSec?: number;
+  maxDurationSec?: number;
+}
+
+interface SliceCommandOptions {
+  input: string;
+  anime: string;
+  episode?: string;
+  subtitle?: string;
+  output?: string;
+  minClips: string;
+  maxClips: string;
+  minDuration: string;
+  maxDuration: string;
+  app?: string;
+  publish?: boolean;
+  publishedSlug?: string;
+}
+
+interface IngestCommandOptions {
+  input: string;
+  anime?: string;
+  episode?: string;
+  subtitle?: string;
+  metadata?: string;
+  output?: string;
+  minClips?: string;
+  maxClips?: string;
+  minDuration?: string;
+  maxDuration?: string;
+  app?: string;
+  publish?: boolean;
+  publishedSlug?: string;
+}
+
+interface WatchInboxCommandOptions {
+  inbox?: string;
+  outputRoot?: string;
+  app?: string;
+  minClips?: string;
+  maxClips?: string;
+  minDuration?: string;
+  maxDuration?: string;
+}
+
+interface WatchState {
+  processed: Record<string, string>;
+}
+
 function slugify(input: string, fallback: string) {
   const slug = input
     .toLowerCase()
@@ -22,8 +80,38 @@ function slugify(input: string, fallback: string) {
   return slug || fallback;
 }
 
+function humanizeStem(stem: string) {
+  return stem
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function basenameWithoutExtension(pathValue: string) {
+  const fileName = basename(pathValue);
+  const extension = extname(fileName);
+  return fileName.slice(0, extension ? -extension.length : undefined);
+}
+
+function isVideoFile(pathValue: string) {
+  return VIDEO_EXTENSIONS.has(extname(pathValue).toLowerCase());
+}
+
+function isSubtitleFile(pathValue: string) {
+  return SUBTITLE_EXTENSIONS.includes(extname(pathValue).toLowerCase());
+}
+
 async function ensureFileExists(pathValue: string) {
   await access(pathValue, fsConstants.F_OK);
+}
+
+async function pathExists(pathValue: string) {
+  try {
+    await access(pathValue, fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function parseIntegerOption(value: string, label: string) {
@@ -32,6 +120,43 @@ function parseIntegerOption(value: string, label: string) {
     throw new Error(`${label} must be an integer.`);
   }
   return parsed;
+}
+
+function pickString(...values: Array<string | undefined>) {
+  return values.find((value) => typeof value === "string" && value.trim())?.trim();
+}
+
+async function findSidecarSubtitle(inputPath: string) {
+  const basePath = join(dirname(inputPath), basenameWithoutExtension(inputPath));
+  for (const extension of SUBTITLE_EXTENSIONS) {
+    const candidate = `${basePath}${extension}`;
+    if (await pathExists(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+async function readAutoMetadata(metadataPath?: string) {
+  if (!metadataPath) {
+    return {} as AutoMetadata;
+  }
+
+  const raw = JSON.parse(await readFile(metadataPath, "utf8")) as unknown;
+  if (!raw || typeof raw !== "object") {
+    return {} as AutoMetadata;
+  }
+
+  const item = raw as Record<string, unknown>;
+  return {
+    animeTitle: typeof item.animeTitle === "string" ? item.animeTitle : undefined,
+    episodeTitle: typeof item.episodeTitle === "string" ? item.episodeTitle : undefined,
+    publishedSlug: typeof item.publishedSlug === "string" ? item.publishedSlug : undefined,
+    minClips: typeof item.minClips === "number" ? item.minClips : undefined,
+    maxClips: typeof item.maxClips === "number" ? item.maxClips : undefined,
+    minDurationSec: typeof item.minDurationSec === "number" ? item.minDurationSec : undefined,
+    maxDurationSec: typeof item.maxDurationSec === "number" ? item.maxDurationSec : undefined,
+  };
 }
 
 async function resolveSubtitleBuild(inputPath: string, subtitlePath?: string) {
@@ -141,20 +266,7 @@ async function loadManifestFromPath(manifestPath: string) {
   return raw;
 }
 
-async function runSliceCommand(options: {
-  input: string;
-  anime: string;
-  episode?: string;
-  subtitle?: string;
-  output?: string;
-  minClips: string;
-  maxClips: string;
-  minDuration: string;
-  maxDuration: string;
-  app?: string;
-  publish?: boolean;
-  publishedSlug?: string;
-}) {
+async function runSliceCommand(options: SliceCommandOptions) {
   const inputPath = resolve(options.input);
   const subtitlePath = options.subtitle ? resolve(options.subtitle) : undefined;
   const outputDir = resolve(options.output ?? join(process.cwd(), "output", slugify(options.anime, "anime-study")));
@@ -209,6 +321,216 @@ async function runSliceCommand(options: {
   await writeFile(join(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   console.log(`[done] Wrote ${exportedClips.length} clips and manifest.`);
   await publishIfEnabled(manifest, options);
+}
+
+async function buildIngestCommandOptions(options: IngestCommandOptions) {
+  const inputPath = resolve(options.input);
+  await ensureFileExists(inputPath);
+
+  const defaultMetadataPath = join(dirname(inputPath), `${basenameWithoutExtension(inputPath)}.json`);
+  const metadataPath = options.metadata
+    ? resolve(options.metadata)
+    : (await pathExists(defaultMetadataPath))
+      ? defaultMetadataPath
+      : undefined;
+  const metadata = await readAutoMetadata(metadataPath);
+  const subtitlePath = pickString(options.subtitle, await findSidecarSubtitle(inputPath));
+  const animeTitle =
+    pickString(options.anime, metadata.animeTitle) ?? humanizeStem(basenameWithoutExtension(inputPath));
+  const episodeTitle = pickString(options.episode, metadata.episodeTitle);
+  const publishedSlug =
+    pickString(options.publishedSlug, metadata.publishedSlug) ??
+    slugify(`${animeTitle}-${episodeTitle ?? basenameWithoutExtension(inputPath)}`, basenameWithoutExtension(inputPath));
+
+  return {
+    input: inputPath,
+    anime: animeTitle,
+    episode: episodeTitle,
+    subtitle: subtitlePath,
+    output:
+      options.output ??
+      join(process.cwd(), "output", publishedSlug),
+    minClips: String(
+      parseIntegerOption(
+        pickString(options.minClips, metadata.minClips?.toString()) ?? "5",
+        "min-clips",
+      ),
+    ),
+    maxClips: String(
+      parseIntegerOption(
+        pickString(options.maxClips, metadata.maxClips?.toString()) ?? "15",
+        "max-clips",
+      ),
+    ),
+    minDuration: String(
+      parseIntegerOption(
+        pickString(options.minDuration, metadata.minDurationSec?.toString()) ?? "10",
+        "min-duration",
+      ),
+    ),
+    maxDuration: String(
+      parseIntegerOption(
+        pickString(options.maxDuration, metadata.maxDurationSec?.toString()) ?? "60",
+        "max-duration",
+      ),
+    ),
+    app: options.app,
+    publish: options.publish,
+    publishedSlug,
+  } satisfies SliceCommandOptions;
+}
+
+async function runIngestCommand(options: IngestCommandOptions) {
+  const resolved = await buildIngestCommandOptions(options);
+  await runSliceCommand(resolved);
+}
+
+async function loadWatchState(statePath: string) {
+  if (!(await pathExists(statePath))) {
+    return {
+      processed: {},
+    } satisfies WatchState;
+  }
+
+  try {
+    const raw = JSON.parse(await readFile(statePath, "utf8")) as WatchState;
+    if (!raw || typeof raw !== "object" || typeof raw.processed !== "object") {
+      return {
+        processed: {},
+      } satisfies WatchState;
+    }
+    return raw;
+  } catch {
+    return {
+      processed: {},
+    } satisfies WatchState;
+  }
+}
+
+async function saveWatchState(statePath: string, state: WatchState) {
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+}
+
+async function fingerprintFile(pathValue: string) {
+  const details = await stat(pathValue);
+  return `${details.size}:${Math.round(details.mtimeMs)}`;
+}
+
+async function findSiblingVideo(filePath: string) {
+  const extension = extname(filePath);
+  const stemPath = filePath.slice(0, extension ? -extension.length : undefined);
+
+  for (const candidateExtension of VIDEO_EXTENSIONS) {
+    const candidate = `${stemPath}${candidateExtension}`;
+    if (await pathExists(candidate)) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+async function runWatchInboxCommand(options: WatchInboxCommandOptions) {
+  const inboxDir = resolve(options.inbox ?? join(process.cwd(), "inbox"));
+  const outputRoot = resolve(options.outputRoot ?? join(process.cwd(), "output", "watched"));
+  const statePath = join(inboxDir, ".watch-state.json");
+
+  await Promise.all([ensureDirectory(inboxDir), ensureDirectory(outputRoot)]);
+
+  const state = await loadWatchState(statePath);
+  let queue = Promise.resolve();
+  const active = new Set<string>();
+
+  const processVideo = async (videoPath: string) => {
+    const absoluteVideoPath = resolve(videoPath);
+    if (!isVideoFile(absoluteVideoPath)) {
+      return;
+    }
+
+    if (!(await pathExists(absoluteVideoPath))) {
+      return;
+    }
+
+    const fingerprint = await fingerprintFile(absoluteVideoPath);
+    if (state.processed[absoluteVideoPath] === fingerprint) {
+      return;
+    }
+
+    const stem = basenameWithoutExtension(absoluteVideoPath);
+    console.log(`[watch] Processing ${basename(absoluteVideoPath)}`);
+    await runIngestCommand({
+      input: absoluteVideoPath,
+      output: join(outputRoot, slugify(stem, "episode")),
+      minClips: options.minClips,
+      maxClips: options.maxClips,
+      minDuration: options.minDuration,
+      maxDuration: options.maxDuration,
+      app: options.app,
+      publish: true,
+    });
+    state.processed[absoluteVideoPath] = fingerprint;
+    await saveWatchState(statePath, state);
+    console.log(`[watch] Finished ${basename(absoluteVideoPath)}`);
+  };
+
+  const enqueueVideo = (videoPath: string) => {
+    const absoluteVideoPath = resolve(videoPath);
+    if (active.has(absoluteVideoPath)) {
+      return;
+    }
+
+    active.add(absoluteVideoPath);
+    queue = queue
+      .then(() => processVideo(absoluteVideoPath))
+      .catch((error) => {
+        console.error(error instanceof Error ? error.message : error);
+      })
+      .finally(() => {
+        active.delete(absoluteVideoPath);
+      });
+  };
+
+  const watcher = chokidar.watch(inboxDir, {
+    ignoreInitial: false,
+    awaitWriteFinish: {
+      stabilityThreshold: 1200,
+      pollInterval: 200,
+    },
+  });
+
+  console.log(`[watch] Watching inbox: ${inboxDir}`);
+
+  watcher.on("add", (pathValue) => {
+    if (isVideoFile(pathValue)) {
+      enqueueVideo(pathValue);
+      return;
+    }
+
+    if (isSubtitleFile(pathValue) || extname(pathValue).toLowerCase() === ".json") {
+      void findSiblingVideo(pathValue).then((videoPath) => {
+        if (videoPath) {
+          enqueueVideo(videoPath);
+        }
+      });
+    }
+  });
+
+  watcher.on("change", (pathValue) => {
+    if (isVideoFile(pathValue)) {
+      delete state.processed[resolve(pathValue)];
+      enqueueVideo(pathValue);
+      return;
+    }
+
+    if (isSubtitleFile(pathValue) || extname(pathValue).toLowerCase() === ".json") {
+      void findSiblingVideo(pathValue).then((videoPath) => {
+        if (videoPath) {
+          delete state.processed[resolve(videoPath)];
+          enqueueVideo(videoPath);
+        }
+      });
+    }
+  });
 }
 
 async function runSyncAppCommand(options: {
@@ -274,6 +596,48 @@ program
   .action(async (options) => {
     try {
       await runSliceCommand(options);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : error);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("ingest")
+  .requiredOption("--input <path>", "Path to a local anime video file.")
+  .option("--anime <title>", "Anime title. Defaults to sidecar metadata or the filename.")
+  .option("--episode <title>", "Episode label.")
+  .option("--subtitle <path>", "Optional subtitle path. Defaults to a same-name sidecar subtitle if found.")
+  .option("--metadata <path>", "Optional sidecar JSON with animeTitle/episodeTitle and slicing settings.")
+  .option("--output <dir>", "Output directory. Defaults to ./output/<derived-slug>.")
+  .option("--min-clips <count>", "Minimum number of clips.")
+  .option("--max-clips <count>", "Maximum number of clips.")
+  .option("--min-duration <seconds>", "Minimum duration per clip in seconds.")
+  .option("--max-duration <seconds>", "Maximum duration per clip in seconds.")
+  .option("--app <dir>", "Target YuruNihongo app directory.")
+  .option("--published-slug <slug>", "Optional publish folder slug.")
+  .option("--no-publish", "Do not auto-publish into the detected YuruNihongo app repo.")
+  .action(async (options) => {
+    try {
+      await runIngestCommand(options);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : error);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("watch-inbox")
+  .option("--inbox <dir>", "Folder to watch for new video files. Defaults to ./inbox.")
+  .option("--output-root <dir>", "Base output folder for watched renders. Defaults to ./output/watched.")
+  .option("--app <dir>", "Target YuruNihongo app directory.")
+  .option("--min-clips <count>", "Minimum number of clips to generate per video.")
+  .option("--max-clips <count>", "Maximum number of clips to generate per video.")
+  .option("--min-duration <seconds>", "Minimum duration per clip in seconds.")
+  .option("--max-duration <seconds>", "Maximum duration per clip in seconds.")
+  .action(async (options) => {
+    try {
+      await runWatchInboxCommand(options);
     } catch (error) {
       console.error(error instanceof Error ? error.message : error);
       process.exitCode = 1;

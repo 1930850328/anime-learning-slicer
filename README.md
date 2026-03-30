@@ -12,6 +12,7 @@ Local CLI that turns a full anime episode into study-friendly short clips.
 - Generates study metadata for each clip: anime title, knowledge points, example sentence, key notes, bilingual subtitles, and cover images
 - Auto-publishes generated clips into the YuruNihongo app's `public/generated-slices` directory
 - Includes a `sync-app` command with optional watch mode powered by `chokidar`
+- Includes an `ingest` command for one local video file and a `watch-inbox` mode for zero-click batch automation
 
 ## Quick start
 
@@ -34,6 +35,33 @@ To re-sync an existing slicer output into the app:
 
 ```bash
 npm start -- sync-app --manifest ./output/bocchi-ep01/manifest.json --app ../Happy-Japannese
+```
+
+To hand one local video file directly to the slicer and let it derive the title from the filename:
+
+```bash
+npm start -- ingest --input ./episode01.mkv --app ../Happy-Japannese
+```
+
+To watch an inbox folder and process every new video automatically:
+
+```bash
+npm start -- watch-inbox --inbox ./inbox --app ../Happy-Japannese
+```
+
+If a same-name subtitle file exists next to the video, it will be picked up automatically.
+If a same-name JSON file exists, it can override metadata:
+
+```json
+{
+  "animeTitle": "Bocchi the Rock!",
+  "episodeTitle": "EP01",
+  "publishedSlug": "bocchi-ep01",
+  "minClips": 6,
+  "maxClips": 12,
+  "minDurationSec": 12,
+  "maxDurationSec": 45
+}
 ```
 
 ## FFmpeg
