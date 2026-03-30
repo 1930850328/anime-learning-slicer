@@ -1,0 +1,27 @@
+{
+  "name": "anime-learning-slicer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local CLI for turning anime episodes into study-ready clips with subtitles and knowledge metadata.",
+  "bin": {
+    "anime-learning-slicer": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.0.0",
+    "commander": "^14.0.2",
+    "kuromoji": "^0.1.2",
+    "wanakana": "^5.3.1"
+  },
+  "devDependencies": {
+    "@types/kuromoji": "^0.1.3",
+    "@types/node": "^24.12.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
